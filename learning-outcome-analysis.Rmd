@@ -1,0 +1,508 @@
+---
+title: "Learning Outcome Analysis"
+subtitle: "Efficacy of DKT Generated Learning Paths"
+author: "Daniel Sensen"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document:
+    fig_caption: false
+    toc: true
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup-chunk, include=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE, cache = FALSE, cache.lazy = FALSE, message = FALSE,
+                      warning = FALSE, fig.width = 12, fig.align = "center", fig.pos = "H",
+                      tidy = TRUE, tidy.opts = list(width.cutoff = 68))
+
+options(tinytex.verbose = TRUE)
+
+```
+
+```{r initialization-chunk}
+
+packageList  <- c("futurewhiz.common.code", "data.table", "knitr", "lubridate", "tidyverse", "ggplot2", "parallel",
+                  "MatchIt", "lme4", "performance", "GGally")
+
+newPackages <- packageList[!(packageList %in% installed.packages()[, "Package"])]
+
+if (length(newPackages)) {
+  install.packages(newPackages)
+}
+
+invisible(lapply(packageList, library, character.only = TRUE))
+
+OVERWRITE_TABLES <- FALSE
+MC_CORES <- detectCores() - 1
+
+graphPath <- "./04-graphs/"
+dataPath <- "./02-data/"
+
+```
+
+```{r operational-functions}
+
+`%notin%` <- Negate(`%in%`)
+
+filterLearningPaths <- function(input_data_table, filter){
+  #' @desc filters a data.table to only include learning paths of interest
+  #' @param input_data_table a data.table object containing learning path information, retrieved by getLearningPathData() 
+  #' @param filter a selection of the filter to apply: "target_topic_done", "no_skip" or "closed"
+  #' @return a filtered data.table containing learning path data
+  
+  finishedTargetTopics <- input_data_table[
+      target_topic_id == recommended_topic & lp_step_type == "exercise", 
+      .(finished = !any(is.na(correct)), 
+      length = tail(recommended_topic_position, 1)),                  
+      by = learning_path_id
+    ]
+  
+  finishedTargetTopicIDs <- finishedTargetTopics[
+      finished == TRUE & length > 1,  # some learning paths were only the target topic itself, these get excluded here             
+      unique(learning_path_id)                                      
+    ]
+  
+  stepSkippedIDs <- input_data_table[
+      lp_step_skipped == 1,
+      unique(learning_path_id)
+    ]
+  
+  closedLearningPathIDs <- input_data_table[
+      closed == 1,
+      unique(learning_path_id)
+    ]
+  
+  if (filter == "target_topic_done") {
+    output_data_table <- input_data_table[
+      (learning_path_id < 2685 | learning_path_id > 2949) & #filers out the affected learning paths of the bug from 20.06 - 24.06
+      (learning_path_id %in% finishedTargetTopicIDs)
+    ]
+  } else if (filter == "no_skip") {
+    output_data_table <- input_data_table[
+      (learning_path_id < 2685 | learning_path_id > 2949) & #filers out the affected learning paths of the bug from 20.06 - 24.06
+      !(learning_path_id %in% stepSkippedIDs) & 
+      (learning_path_id %in% finishedTargetTopicIDs)
+    ]
+  } else if (filter == "closed") {
+    output_data_table <- input_data_table[
+      (learning_path_id < 2685 | learning_path_id > 2949) & #filers out the affected learning paths of the bug from 20.06 - 24.06
+      !(learning_path_id %in% stepSkippedIDs) & 
+      (learning_path_id %in% finishedTargetTopicIDs) & 
+      (learning_path_id %in% closedLearningPathIDs)
+    ]
+  }
+  
+  return(output_data_table)
+}
+
+filterControlData <- function(input_data_table) {
+  #' @desc Filters out observations in the control group data where a user did repetitions of topics right after another 
+  #' @param input_data_table A data.table object containing control group learning information
+  #' @return A filtered data.table containing control group data without repetition observations
+  
+  repetitionDT <- input_data_table[, .(user_id = last(user_id), topic_id = last(topic_id)), by = exercise_id]
+  
+  setorder(repetitionDT, user_id, exercise_id)
+  
+  repetitionDT[, `:=`(
+    previous_topic_ids = shift(topic_id, 1, type = "lag"),
+    prev2_topic_ids = shift(topic_id, 2, type = "lag"),
+    prev3_topic_ids = shift(topic_id, 3, type = "lag")
+  ), by = user_id]
+  
+  repExercises <- repetitionDT[
+    topic_id == previous_topic_ids | 
+    topic_id == prev2_topic_ids | 
+    topic_id == prev3_topic_ids, 
+    .(exercise_id)
+  ]
+  
+  repExercises <- unique(repExercises$exercise_id)
+  
+  controlGroupClean <- input_data_table[exercise_id %notin% repExercises]
+  
+  return(controlGroupClean)
+}
+
+calculateQuestionCountExperiment <- function(finished_exercise_data){
+  #' @desc calculates the number of questions a user has done before a certain exercise_answer_id within the experiment period
+  #' @param finished_exercise_data data containing all finished math exercise questions within the experiment period, retrieved
+  #' with getFinishedQuestionData()
+  #' @return a data.table that contains for each exercise_answer_id the number of questions a user has practiced before 
+  #' that point in time
+
+  finished_exercise_data[, finished_at := as.POSIXct(finished_at)]
+  
+  setorder(finished_exercise_data, user_id, finished_at)
+  
+  finished_exercise_data[, questions_before := .I - .I[1L], by = user_id]
+  
+  finished_exercise_data[, finished_date := as.Date(finished_at)]
+  
+  finished_exercise_data[, questions_before_same_day := .I - .I[1L], by = .(user_id, finished_date)]
+  
+  questionCountExperiment <- finished_exercise_data[, .(exercise_answer_id, questions_before, questions_before_same_day)]
+
+  return(questionCountExperiment)
+}
+
+extractFinalLearningPathData <- function(input_data_table){
+  #' @desc filter out only target topic questions from the learning path data and extract skip and length variable
+  #' @param input_data_table a data.table containing learning path infromation
+  #' @return data.table containing target topic questions and the variables skip & length 
+
+  skipNoSkip <- input_data_table[, .(
+    skip = as.integer(any(lp_step_skipped == 1))
+  ), by = learning_path_id]
+  
+  mergedData <- merge(input_data_table, skipNoSkip, by = "learning_path_id", all.x = TRUE)
+  
+  filteredData <- mergedData[target_topic_id == recommended_topic & lp_step_type == "exercise"]
+  
+  finalLearningPathData <- filteredData[, length := last(recommended_topic_position) - 1, by = learning_path_id]
+  
+  return(finalLearningPathData)
+}
+
+extractDKTpredictions <- function(dkt_predictions) {
+  #' @desc reshapes retrieved dkt predictions to be ready for further processing
+  #' @param dkt_predictions a data.table containing dkt predictions, retrieved with getDKTpredictions()
+  #' @return a data.table with reshaped dkt predictions 
+
+  filteredDT <- dkt_predictions[
+    (json_target_topic_id == target_topic_id) &
+    (learning_path_id < 2685 | learning_path_id > 2949)
+  ]
+  
+  reshapedDT <- rbindlist(list(
+    filteredDT[, .(learning_path_id, 
+                   topic_id = as.numeric(target_topic_id), 
+                   predicted_mastery_score = as.numeric(predicted_mastery_score_target_topic), 
+                   position = 4)],
+    filteredDT[, .(learning_path_id, 
+                   topic_id = as.numeric(recommended_topic_id_1), 
+                   predicted_mastery_score = as.numeric(predicted_mastery_score_1), 
+                   position = 1)],
+    filteredDT[, .(learning_path_id, 
+                   topic_id = as.numeric(recommended_topic_id_2), 
+                   predicted_mastery_score = as.numeric(predicted_mastery_score_2), 
+                   position = 2)],
+    filteredDT[, .(learning_path_id, 
+                   topic_id = as.numeric(recommended_topic_id_3), 
+                   predicted_mastery_score = as.numeric(predicted_mastery_score_3), 
+                   position = 3)]
+  ), use.names = TRUE)
+  
+  reshapedDT <- reshapedDT[!is.na(topic_id)]
+  
+  filteredReshapedDT <- reshapedDT[predicted_mastery_score != 0.6]
+  
+  return(filteredReshapedDT)
+}
+
+extractObservedMasteries <- function(input_data_table) {
+  #' @desc extracts observed masteries (correct ratios) from learning path students 
+  #' @param input_data_table a data.table containing filtered learning path information
+  #' @return  a data.table containing the observed correct ratios for within their learning paths 
+
+  filteredDT <- input_data_table[lp_step_type == "exercise" & !is.na(finished_at)]
+
+  summarizedDT <- filteredDT[, .(correct_ratio = mean(correct)), by = .(learning_path_id, recommended_topic)]
+
+  resultDT <- summarizedDT[, .(learning_path_id, topic_id = recommended_topic, observed_mastery = correct_ratio)]
+  
+  return(resultDT)
+}
+
+findPreviousExercises <- function(control_data) {
+  #' @desc finds the exercises a control user did before proceeding to a certain topic  
+  #' @param control_data a data.table containing filtered control data information 
+  #' @return a data.table containing the exercises a control user did before proceeding to a certain topic 
+
+  control_data[, answered_at := as.POSIXct(answered_at, format = "%Y-%m-%d %H:%M:%S")]
+
+  controlGroupData <- control_data[
+    , .(exercise_answer_id, exercise_id, topic_id, user_id, variation = 0, question_id, correct, answered_at)
+  ]
+
+  experimentData <- controlGroupData[
+    , .(topic_id = last(topic_id), user_id = last(user_id), 
+        variation = last(variation), last_answered_at = max(answered_at)),
+    by = exercise_id]
+
+  allTopicIDs <- unique(experimentData$topic_id)
+
+  previousExercisesList <- list()
+
+  for (topic in allTopicIDs) {
+    targetExercises <- experimentData[topic_id == topic]
+
+    for (user in unique(targetExercises$user_id)) {
+      userData <- controlGroupData[user_id == user]
+      targetExerciseIDs <- targetExercises[user_id == user]$exercise_id
+
+      for (target_exercise_id in targetExerciseIDs) {
+        lastAnswerTime <- targetExercises[exercise_id == target_exercise_id]$last_answered_at
+
+        # Filter exercises answered within 3 hours before the target exercise's last answered time
+        # and where exercise_id is smaller than target_exercise_id
+        previousExercises <- userData[
+          exercise_id < target_exercise_id & 
+          answered_at < lastAnswerTime & 
+          answered_at >= (lastAnswerTime - hours(3)), 
+          .SD[order(-answered_at)], .SDcols = c("exercise_id", "topic_id", "answered_at")
+        ]
+
+        previousExercises <- unique(previousExercises, by = "exercise_id")
+        
+        if (nrow(previousExercises) > 0) {
+          previousExercises <- previousExercises[1:min(3, nrow(previousExercises))]
+          previousExercises[, user_id := user]
+          previousExercises[, target_exercise_id := target_exercise_id]
+          previousExercises[, target_topic_id := topic]
+          previousExercises[, position := .I]
+          previousExercisesList[[length(previousExercisesList) + 1]] <- previousExercises
+        }
+      }
+    }
+  }
+
+  previousExercisesDT <- rbindlist(previousExercisesList, use.names = TRUE, fill = TRUE)
+
+  previousExercisesDT <- na.omit(previousExercisesDT)
+
+  return(previousExercisesDT)
+}
+
+getMostSelectedTargetTopics <- function(learning_path_data) {
+  #' @desc finds the topics for which most learning paths were generated    
+  #' @param learning_path_data a data.table containing learning path information 
+  #' @return a vector of integers containg the 3 topics for which most learning paths were created 
+
+  aggregatedLearningPaths <- learning_path_data[, .(topic_id = last(target_topic_id)), by = exercise_id]
+  
+  countedTopics <- aggregatedLearningPaths[, .(count = .N), by = topic_id]
+  
+  countedOrderedTopics <- countedTopics[order(-count)][1:3,]
+  
+  mostSelectedTargetTopics <- countedOrderedTopics[, topic_id]
+  
+  return(mostSelectedTargetTopics)
+}
+
+getTop3TopicsPercentages <- function(data, target_topic, id_column, filter_column) {
+  #' @desc finds the topics that were most often done by control and test users before a selected target topic
+  #' it also gives the percentages of how often these topics were done before the selected target topic  
+  #' @param data a data.table containing users exercise history data 
+  #' @param target_topic the target topic for which the prior topics should be calculated 
+  #' @param id_column a column name variable to make the function reusable for control and test data
+  #' @param filter_column a column name variable to make the function reusable for control and test data
+  #' @return a data.table containing the topics that were most often done before a selected target topic
+  
+  filteredData <- data[target_topic_id == target_topic]
+  
+  filteredData <- filteredData[get(id_column) != target_topic_id]
+  
+  topTopics <- filteredData[, .(count = .N), by = get(id_column)]
+  
+  topTopics <- topTopics[order(-count)][1:3]
+  
+  topTopics[, total := uniqueN(filteredData[[filter_column]])]
+  
+  topTopics[, percentage := (count / total) * 100]
+  
+  return(topTopics)
+}
+```
+
+```{r data-retrieval}
+
+learningPathDT <- getLearningPathData()
+controlGroupDT <- getControlGroupData()
+
+```
+
+```{r filter-data}
+
+filteredLearningPathDT <- filterLearningPaths(learningPathDT, "target_topic_done")
+filteredCotrolData <- filterControlData(controlGroupDT)
+
+```
+
+```{r required-data-for-matching}
+
+questionCounts <- getQuestionCountData()
+userMathMasteries <- getUserMathMasteries()
+questionDifficulties <- getQuestionDifficulties()
+finishedQuestionData <- getFinishedQuestionData()
+qustionCountExperiment <- calculateQuestionCountExperiment(finishedQuestionData) 
+userSchooltracks <- getUserSchoolTracks()
+
+experimentData <- mergeExperimentData(filteredLearningPathDT, filteredCotrolData, questionCounts, userMathMasteries, questionDifficulties, qustionCountExperiment, userSchooltracks)
+
+```
+
+```{r sample-matching}
+
+experimentUserData <- experimentData[, .(
+  variation = tail(variation, 1), 
+  question_count = tail(question_count, 1), 
+  math_mastery = tail(math_mastery, 1), 
+  school_track = tail(school_track, 1)
+), by = user_id]
+
+matchingUsersOutput <- matchit(variation ~ question_count + math_mastery + school_track, 
+                  data = experimentUserData, method = "nearest", distance = "mahalanobis")
+
+matchedUsersOutputData <- match.data(matchingUsersOutput)
+
+matchedUsers <- unique(matchedUsersOutputData[, .(user_id)])[, user_id]
+
+experimentDataFinal <- experimentData[user_id %in% matchedUsers]
+
+matchingObservationsOutput <- matchit(variation ~  question_count + math_mastery + questions_before + 
+                                      questions_before_same_day + question_difficulty + school_track, 
+                                      data = experimentDataFinal, method = "nearest", distance = "mahalanobis")
+
+matchedData <- match.data(matchingObservationsOutput)
+
+summary(matchingObservationsOutput)
+
+```
+
+```{r hypothesis-1-model}
+
+nullModel1 <- glmer(correct ~ (1| user_id), data = matchedData, family = "binomial")
+model1 <- glmer(correct ~ variation + (1| user_id), data = matchedData, family = "binomial")
+anova(nullModel1, model1)
+summary(model1)
+check_overdispersion(model1)
+
+randomEffects1 <- ranef(model1)$user_id[[1]]
+qqnorm(randomEffects1)
+qqline(randomEffects1, col = "black")
+
+```
+
+```{r hypothesis-2-and-3-models}
+
+finalLearningPathData <- extractFinalLearningPathData(filteredLearningPathDT)
+nullModel2 <- glmer(correct ~ (1| user_id), data = finalLearningPathData, family = "binomial")
+sModel2 <- glmer(correct ~ skip + (1| user_id), data = finalLearningPathData, family = "binomial")
+lModel2 <- glmer(correct ~ length + (1| user_id), data = finalLearningPathData, family = "binomial")
+anova(nullModel2, lModel2)
+anova(nullModel2, sModel2)
+check_overdispersion(sModel2)
+check_overdispersion(lModel2)
+summary(lModel2)
+summary(sModel2)
+
+randomEffects2 <- ranef(lModel2)$user_id[[1]]
+qqnorm(randomEffects2)
+qqline(randomEffects2, col = "black")
+
+randomEffects3 <- ranef(sModel2)$user_id[[1]]
+qqnorm(randomEffects3)
+qqline(randomEffects3, col = "black")
+```
+
+```{r figure-5-dkt-prediction-correlations}
+
+dktPredictions <- getDKTpredictions()
+dktPredicitonsFilteredReshaped <- extractDKTpredictions(dktPredictions)
+observedMasteries <- extractObservedMasteries(filteredLearningPathDT)
+mergedMasteries <- merge(observedMasteries, dktPredicitonsFilteredReshaped, by = c("learning_path_id", "topic_id"))
+cor.test(mergedMasteries$observed_mastery, mergedMasteries$predicted_mastery_score)
+
+mergedMasteries %>% 
+  ggplot(aes(x = observed_mastery, y = predicted_mastery_score)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE, colour = "grey") +
+  theme_minimal() + 
+  labs(x = "Observed Mastery (Correct Ratio)", y = "Predicted Mastery")
+
+ggpairs(mergedMasteries, 
+        columns = c("observed_mastery", "predicted_mastery_score"),
+        title = "Correlation Plot")
+
+```
+
+```{r figure-6-and-12-paths-comparison}
+
+timeSpent <- filteredLearningPathDT[!is.na(exercise_id),
+                                 .(first_answer = as.POSIXct(answer_time[which.min(exercise_answer_id)]), 
+                                   last_answer = as.POSIXct(answer_time[which.max(exercise_answer_id)])), 
+                                 by = learning_path_id
+                                 ][!is.na(first_answer) & !is.na(last_answer),
+                                   .(time_spent = last_answer - first_answer),
+                                   by = learning_path_id
+                                   ][!is.na(time_spent),
+                                     .(mean_time_spent = mean(time_spent, na.rm = TRUE), 
+                                       median_time_spent = median(time_spent, na.rm = TRUE), 
+                                       ninety_percentile = quantile(time_spent, 0.9, na.rm = TRUE))
+                                     ]
+
+previousExercisesControl <- findPreviousExercises(filteredCotrolData)
+
+mostSelectedTargetTopics <- getMostSelectedTargetTopics(filteredLearningPathDT)
+
+reshapedLearningPathDT <- filteredLearningPathDT[, .(learning_path_id = last(learning_path_id),
+                                                    target_topic_id = last(target_topic_id),
+                                                    recommended_topic_position = 
+                                                    last(recommended_topic_position),
+                                                    recommended_topic = last(recommended_topic)),
+                                                  by = .(learning_path_id, recommended_topic_position)
+                                                 ][order(learning_path_id, recommended_topic_position)
+                                                  ][target_topic_id != recommended_topic]
+
+top3TopicsPercentages <- rbindlist(lapply(mostSelectedTargetTopics, function(topic) {
+  result <- getTop3TopicsPercentages(reshapedLearningPathDT, topic, "recommended_topic", "learning_path_id")
+  result[, target_topic_id := topic]
+  return(result)
+}))
+
+top3TopicsPercentagesControl <- rbindlist(lapply(mostSelectedTargetTopics, function(topic) {
+  result <- getTop3TopicsPercentages(previousExercisesControl, topic, "topic_id", "target_exercise_id")
+  result[, target_topic_id := topic]
+  return(result)
+}))
+
+```
+
+```{r figure-7-activity-comparison}
+
+activityComparisonDT <- finishedQuestionData %>%
+  filter(user_id %in% matchedUsers) %>%
+  left_join(matchedUsersOutputData, by = "user_id") %>%
+  group_by(user_id) %>%
+  summarise(n_questions = n(), variation = last(variation)) %>%
+  mutate(group = ifelse(variation == 1, "Test", "Control")) %>%
+  ungroup()
+
+meanValuesActivityComparison <- activityComparisonDT %>%
+  group_by(group) %>%
+  summarize(mean_n_questions = mean(n_questions), median_n_questions = median(n_questions))
+
+tTestActivity <- t.test(n_questions ~ variation, data = activityComparisonDT)
+std_devs <- tapply(activityComparisonDT$n_questions, activityComparisonDT$variation, sd)
+
+ggplot(activityComparisonDT, aes(x = group, y = n_questions, color = factor(variation))) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.8), alpha = 0.5) +
+  stat_summary(fun.data = mean_cl_normal, geom = "errorbar", 
+               position = position_dodge(width = 0.8), width = 0.2, size = 1.5, color = "black",) +
+  stat_summary(fun = mean, geom = "point", 
+               shape = 18, size = 5, color = "black", fill = "white", 
+               position = position_dodge(width = 0.8)) +
+  labs(x = "Control/ Test Group", y = "Number of Questions Answered",
+       color = "Variation") +
+  theme_minimal() +
+  scale_color_manual(values = c("lightgrey", "darkgrey")) +
+  geom_text(data = meanValuesActivityComparison, 
+            aes(label = paste("Mean: ",round(mean_n_questions, 2)), y = mean_n_questions, x = group), 
+            color = "black", size = 4, hjust = -0.8) +
+  guides(color = FALSE)
+
+```
